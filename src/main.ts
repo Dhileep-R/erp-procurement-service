@@ -23,6 +23,9 @@ import {
 } from 'typeorm';
 import { InjectRepository } from '@nestjs/typeorm';
 import Redis from 'ioredis';
+import { ManyToOne, JoinColumn } from 'typeorm';
+import * as dotenv from 'dotenv';
+dotenv.config();
 
 /* ================== ENTITY ================== */
 
@@ -35,13 +38,29 @@ class PurchaseOrder {
   poNumber!: string;
 }
 
+@Entity()
+class PoLineItem {
+  @PrimaryGeneratedColumn()
+  id!: number;
+
+  @Column()
+  poId!: number;
+
+  @Column()
+  count!: number;
+
+  @ManyToOne(() => PurchaseOrder, { onDelete: 'CASCADE' })
+  @JoinColumn({ name: 'poId' })
+  po!: PurchaseOrder;
+}
+
 /* ================== REDIS SERVICE ================== */
 
 @Injectable()
 class RedisService {
   private client = new Redis({
-    host: '127.0.0.1',
-    port: 6380,
+    host: process.env.REDIS_HOST,
+    port: Number(process.env.REDIS_PORT),
   });
 
   async set(key: string, value: unknown): Promise<void> {
@@ -88,14 +107,32 @@ class JwtAuthGuard implements CanActivate {
 class PoService {
   constructor(
     @InjectRepository(PurchaseOrder)
-    private readonly repo: Repository<PurchaseOrder>,
-    private readonly redis: RedisService,
+  private readonly repo: Repository<PurchaseOrder>,
+
+  @InjectRepository(PoLineItem)
+  private readonly lineRepo: Repository<PoLineItem>,
+
+  private readonly redis: RedisService,
   ) {}
 
   async create(poNumber: string): Promise<PurchaseOrder> {
     const po = await this.repo.save({ poNumber });
-    await this.redis.set(`po:id:${po.id}`, po);
-    return po;
+
+  // 2️⃣ Create line items
+  const lineItems = await this.lineRepo.save([
+    { poId: po.id, count: 1 },
+    { poId: po.id, count: 2 },
+  ]);
+
+  const response = {
+    ...po,
+    lineItems,
+  };
+
+  // 3️⃣ Cache
+  await this.redis.set(`po:id:${po.id}`, response);
+
+  return response;
   }
 
   async list(): Promise<PurchaseOrder[]> {
@@ -103,16 +140,54 @@ class PoService {
   }
 
   async getById(id: number): Promise<PurchaseOrder> {
-    const po = await this.redis.get<PurchaseOrder>(`po:id:${id}`);
-    if (!po) throw new Error('PO not found in Redis');
-    return po;
+    const cacheKey = `po:id:${id}`;
+
+  // 1️⃣ Try Redis
+  const cached = await this.redis.get<any>(cacheKey);
+  if (cached) {
+    console.log('✅ Cache HIT');
+    return cached;
+  }
+
+  console.log('❌ Cache MISS → DB');
+
+  // 2️⃣ Fetch PO
+  const po = await this.repo.findOne({ where: { id } });
+  if (!po) throw new Error('PO not found');
+
+  // 3️⃣ Fetch line items
+  const lineItems = await this.lineRepo.find({
+    where: { poId: id },
+  });
+
+  const response = {
+    ...po,
+    lineItems,
+  };
+
+  // 4️⃣ Cache again
+  await this.redis.set(cacheKey, response);
+
+  return response;
   }
 
   async update(id: number, poNumber: string): Promise<PurchaseOrder> {
     await this.repo.update(id, { poNumber });
-    const updated: PurchaseOrder = { id, poNumber };
-    await this.redis.set(`po:id:${id}`, updated);
-    return updated;
+
+  const po = await this.repo.findOne({ where: { id } });
+
+  const lineItems = await this.lineRepo.find({
+    where: { poId: id },
+  });
+
+  const response = {
+    ...po,
+    lineItems,
+  };
+
+  await this.redis.set(`po:id:${id}`, response);
+
+  return response;
   }
 }
 
@@ -151,19 +226,20 @@ class PoController {
 @Module({
   imports: [
     JwtModule.register({
-      secret: 'ERP_SECRET',
+      secret: process.env.JWT_SECRET,
+      signOptions: { expiresIn: '1h' },
     }),
     TypeOrmModule.forRoot({
       type: 'mysql',
-      host: 'localhost',
-      port: 3306,
-      username: 'root',
-      password: 'Test123#',
-      database: 'erp',
-      entities: [PurchaseOrder],
+      host: process.env.DB_HOST,
+      port: Number(process.env.DB_PORT),
+      username: process.env.DB_USER,
+      password: process.env.DB_PASSWORD,
+      database: process.env.DB_NAME,
+      entities: [PurchaseOrder, PoLineItem],
       synchronize: true,
     }),
-    TypeOrmModule.forFeature([PurchaseOrder]),
+    TypeOrmModule.forFeature([PurchaseOrder, PoLineItem]),
   ],
   controllers: [PoController],
   providers: [
@@ -185,8 +261,8 @@ async function bootstrap(): Promise<void> {
   );
 
   app.enableCors();
-  await app.listen(3002);
-  console.log('Procurement service running on port 3002');
+  await app.listen(process.env.PORT);
+  console.log(`Procurement service running on port ${process.env.PORT}`);
 }
 
 bootstrap();
