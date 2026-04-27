@@ -25,7 +25,9 @@ import { InjectRepository } from '@nestjs/typeorm';
 import Redis from 'ioredis';
 import { ManyToOne, JoinColumn } from 'typeorm';
 import * as dotenv from 'dotenv';
-dotenv.config();
+if (process.env.NODE_ENV !== 'production') {
+  require('dotenv').config();
+}
 
 /* ================== ENTITY ================== */
 
